@@ -7,17 +7,12 @@ import sys
 # import tty
 # import select
 import time
-
-try:
-    import gopigo
-except:
-    pass
+import gopigo
 # import os
 
 # the following libraries may or may not be installed
 # nor needed
 from I2C_mutex import Mutex
-
 mutex = Mutex()
 
 def _ifMutexAcquire(mutex_enabled = False):
@@ -37,11 +32,14 @@ def _ifMutexRelease(mutex_enabled = False):
         mutex.release()
 
 try:
-    from line_follower import line_sensor
-    from line_follower import scratch_line
-    is_line_follower_accessible = True
-except:
-    is_line_follower_accessible = False
+    from di_sensors import easy_line_follower, easy_distance_sensor
+    di_sensors_available = True
+except ImportError as err:
+    di_sensors_available = False
+    print(str(err))
+except Exception as err:
+    di_sensors_available = False
+    print(str(err))
 
 ##########################
 
@@ -212,7 +210,14 @@ class EasyGoPiGo():
         return ButtonSensor(port, gpg=self, use_mutex=self.use_mutex)
 
     def init_line_follower(self, port="I2C"):
-        return LineFollower(port, gpg=self, use_mutex=self.use_mutex )
+        if di_sensors_available is False:
+            raise ImportError("di_sensors library not found")
+
+        lf = easy_line_follower.EasyLineFollower(port, use_mutex=self.use_mutex)
+        if lf._sensor_id == 0:
+            raise OSError("line follower is not reachable")
+
+        return lf
 
     def init_servo(self, port="SERVO"):
         return Servo(port, gpg=self, use_mutex=self.use_mutex)
@@ -652,185 +657,25 @@ class Remote(Sensor):
         return key
 
 ##########################
+#
+# Line Follower
+#
+##########################
 
 
-class LineFollower(Sensor):
-    '''
-    The line follower detects the presence of a black line or its
-      absence.
-    You can use this in one of three ways.
-    1. You can use read_position() to get a simple position status:
-        center, left or right.
-        these indicate the position of the black line.
-        So if it says left, the GoPiGo has to turn right
-    2. You can use read() to get a list of the five sensors.
-        each position in the list will either be a 0 or a 1
-        It is up to you to determine where the black line is.
-    3. You can use read_raw_sensors() to get raw values from all sensors
-        You will have to handle the calibration yourself
-    4. the gpg argument is ignored. Needed for future compatibility
-    '''
+def LineFollower(port="I2C", gpg=None, use_mutex=False):
+    """
+    Use :py:class:`di_sensors.easy_line_follower.EasyLineFollower` instead
+    """
+    if di_sensors_available is False:
+        raise ImportError("di_sensors library not available")
 
-    def __init__(self,
-                port = "I2C",
-                pinmode = "",
-                gpg = None,
-                use_mutex = False):
-        try:
-            Sensor.__init__(self, port, "INPUT", use_mutex)
-            self.set_descriptor("Line Follower")
-            self.last_3_reads = []
-            self.white_line = self.get_white_calibration()
-            self.black_line = self.get_black_calibration()
-            self.threshold = [w+((b-w)/2) for w,b in zip(self.white_line,self.black_line)]
-        except:
-            raise ValueError("Line Follower Library not found")
+    lf = easy_line_follower.EasyLineFollower(port, use_mutex=use_mutex)
+    if lf._sensor_id == 0:
+        raise OSError("line follower is not reachable")
 
-        self.use_mutex = use_mutex
-
-    def read_raw_sensors(self):
-        '''
-        Returns raw values from all sensors
-        From 0 to 1023
-        May return a list of -1 when there's a read error
-        '''
-
-        _ifMutexAcquire(self.use_mutex)
-        try:
-            five_vals = line_sensor.read_sensor()
-        except:
-            pass
-        finally:
-            _ifMutexRelease(self.use_mutex)
-        debug ("raw values {}".format(five_vals))
-
-        if five_vals != -1:
-            return five_vals
-        else:
-            return [-1, -1, -1, -1, -1]
-
-    def get_white_calibration(self):
-        return line_sensor.get_white_line()
-
-    def get_black_calibration(self):
-        return line_sensor.get_black_line()
-
-    def read(self):
-        '''
-        Returns a list of 5 values between 0 and 1
-        Depends on the line sensor being calibrated first
-            through the Line Sensor Calibration tool
-        May return all -1 on a read error
-        '''
-
-        five_vals = [-1,-1,-1,-1,-1]
-
-
-        five_vals = self.read_raw_sensors()
-
-        line_result = []
-        for sensor_reading,cur_threshold in zip(five_vals,self.threshold):
-            if sensor_reading > cur_threshold:
-                line_result.append(1)
-            else:
-                line_result.append(0)
-
-        debug ("Current read is {}".format(line_result))
-
-        if five_vals != [-1,-1,-1,-1,-1]:
-            debug("appending")
-            self.last_3_reads.append(line_result)
-        if len(self.last_3_reads) > 3:
-            self.last_3_reads.pop(0)
-
-        debug (self.last_3_reads)
-        transpose = list(zip(*self.last_3_reads))
-        avg_vals = []
-        for sensor_reading in transpose:
-            # print (sum(sensor_reading)//3)
-            avg_vals.append(sum(sensor_reading)//3)
-
-        debug ("current avg: {}".format(avg_vals))
-        return avg_vals
-
-    def follow_line(self, fwd_speed = 80):
-        slight_turn_speed=int(.7*fwd_speed)
-        while True:
-            pos = self.read_position()
-            debug(pos)
-            if pos == "center":
-                gopigo.forward()
-            elif pos == "left":
-                gopigo.set_right_speed(0)
-                gopigo.set_left_speed(slight_turn_speed)
-            elif pos == "right":
-                gopigo.set_right_speed(slight_turn_speed)
-                gopigo.set_left_speed(0)
-            elif pos == "black":
-                gopigo.stop()
-            elif pos == "white":
-                gopigo.stop()
-
-    def read_position(self):
-        '''
-        Returns a string telling where the black line is, compared to
-            the GoPiGo
-        Returns: "Left", "Right", "Center", "Black", "White"
-        May return "Unknown"
-        This method is not intelligent enough to handle intersections.
-        '''
-        five_vals = self.read()
-
-        if five_vals == [0, 0, 1, 0, 0] or five_vals == [0, 1, 1, 1, 0]:
-            return "center"
-        if five_vals == [1, 1, 1, 1, 1]:
-            return "black"
-        if five_vals == [0, 0, 0, 0, 0]:
-            return "white"
-        if five_vals == [0, 1, 1, 0, 0] or \
-           five_vals == [0, 1, 0, 0, 0] or \
-           five_vals == [1, 0, 0, 0, 0] or \
-           five_vals == [1, 1, 0, 0, 0] or \
-           five_vals == [1, 1, 1, 0, 0] or \
-           five_vals == [1, 1, 1, 1, 0]:
-            return "left"
-        if five_vals == [0, 0, 0, 1, 0] or \
-           five_vals == [0, 0, 1, 1, 0] or \
-           five_vals == [0, 0, 0, 0, 1] or \
-           five_vals == [0, 0, 0, 1, 1] or \
-           five_vals == [0, 0, 1, 1, 1] or \
-           five_vals == [0, 1, 1, 1, 1]:
-            return "right"
-        return "unknown"
-
-    def read_position_str(self):
-        """
-        returns a string of five letters indicating what the line sensor is seeing.
-        'b' indicates that specific sensor has detected a black line.
-        'w' indicates that specific sensor has not detected a black line.
-
-        :returns: String indicating what the line follower just read.
-        :rtype: str
-
-        Here's an example of what could get returned:
-            * ``'bbbbb'`` - when the line follower reads black on all sensors.
-            * ``'wwbww'`` - when the line follower is perfectly centered.
-            * ``'bbbww'`` - when the line follower reaches an intersection.
-        """
-        five_vals  = self.read()
-        out_str = "".join(["b" if sensor_val == 1 else "w" for sensor_val in five_vals])
-        return out_str
-
-    def position_bw(self):
-        self.read_position_str()  # do a double read 
-        return self.read_position_str()[::-1]
-
-    def position_01(self):
-        self.read() # double read
-        return self.read()[::-1]
-
-    position = read_position
-
+    return lf
+    
 #######################################################################
 #
 # SERVO
